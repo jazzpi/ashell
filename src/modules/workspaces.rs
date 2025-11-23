@@ -1,6 +1,7 @@
 use crate::{
     config::{WorkspaceVisibilityMode, WorkspacesModuleConfig},
     outputs::Outputs,
+    services::workspaces::WorkspaceProtocol,
     theme::AshellTheme,
 };
 use hyprland::{
@@ -223,6 +224,7 @@ pub enum Message {
 pub struct Workspaces {
     config: WorkspacesModuleConfig,
     workspaces: Vec<Workspace>,
+    workspace_protocol: Option<WorkspaceProtocol>,
 }
 
 impl Workspaces {
@@ -230,6 +232,7 @@ impl Workspaces {
         Self {
             workspaces: get_workspaces(&config),
             config,
+            workspace_protocol: WorkspaceProtocol::new(),
         }
     }
 
