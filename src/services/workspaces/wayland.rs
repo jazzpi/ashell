@@ -1,14 +1,16 @@
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    rc::Rc,
-    sync::Arc,
-    thread::{self, JoinHandle},
+use anyhow::Result;
+use iced::futures::{
+    StreamExt,
+    channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
 };
-
 use log::{debug, error, info, trace, warn};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+use tokio::task::JoinHandle;
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, WEnum,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
     protocol::{
         wl_display::WlDisplay,
         wl_output::WlOutput,
@@ -20,8 +22,7 @@ use wayland_protocols::ext::workspace::v1::client::{
         Event as WorkspaceGroupEvent, ExtWorkspaceGroupHandleV1, GroupCapabilities,
     },
     ext_workspace_handle_v1::{
-        Event as WorkspaceEvent, ExtWorkspaceHandleV1, State as WorkspaceState,
-        WorkspaceCapabilities,
+        Event as WorkspaceEvent, ExtWorkspaceHandleV1, WorkspaceCapabilities,
     },
     ext_workspace_manager_v1::{
         EVT_WORKSPACE_GROUP_OPCODE, EVT_WORKSPACE_OPCODE, Event as WorkspaceManagerEvent,
@@ -29,7 +30,11 @@ use wayland_protocols::ext::workspace::v1::client::{
     },
 };
 
-#[derive(Default, Debug, PartialEq, Eq, Hash)]
+pub use wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1::State as WorkspaceState;
+
+use super::WorkspaceSnapshot;
+
+#[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Workspace {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -37,83 +42,128 @@ pub struct Workspace {
     pub state: Option<WorkspaceState>,
     pub capabilities: Option<WorkspaceCapabilities>,
 }
-type WorkspaceRef = Rc<RefCell<Workspace>>;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct WorkspaceGroup {
     pub capabilities: Option<GroupCapabilities>,
-    pub outputs: Vec<OutputRef>,
-    pub workspaces: Vec<WorkspaceRef>,
+    pub outputs: HashSet<WlOutput>,
+    pub workspaces: HashSet<ExtWorkspaceHandleV1>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct Output {
     pub name: Option<String>,
     pub description: Option<String>,
 }
-type OutputRef = Rc<RefCell<Output>>;
 
-#[derive(Default)]
-struct WorkspaceProtocolData {
+#[derive(Debug)]
+pub struct WorkspaceProtocolData {
     _manager: Option<(ExtWorkspaceManagerV1, u32)>,
-    workspaces: HashMap<ExtWorkspaceHandleV1, WorkspaceRef>,
+    workspaces: HashMap<ExtWorkspaceHandleV1, Workspace>,
     groups: HashMap<ExtWorkspaceGroupHandleV1, WorkspaceGroup>,
-    outputs: HashMap<WlOutput, OutputRef>,
+    outputs: HashMap<WlOutput, Output>,
+    // updates: UnboundedSender<WorkspaceSnapshot>,
 }
 
+impl From<&WorkspaceProtocolData> for WorkspaceSnapshot {
+    fn from(data: &WorkspaceProtocolData) -> Self {
+        let workspaces: HashMap<_, _> = data
+            .workspaces
+            .iter()
+            .map(|(k, w)| (k, Arc::new(w.clone())))
+            .collect();
+        let outputs: HashMap<&WlOutput, Arc<Output>> = data
+            .outputs
+            .iter()
+            .map(|(k, o)| (k, Arc::new(o.clone())))
+            .collect();
+        let groups = data
+            .groups
+            .values()
+            .map(|g| {
+                Arc::new(super::WorkspaceGroup {
+                    outputs: g
+                        .outputs
+                        .iter()
+                        .filter_map(|o| outputs.get(&o).cloned())
+                        .collect(),
+                    workspaces: g
+                        .workspaces
+                        .iter()
+                        .filter_map(|w| workspaces.get(&w).cloned())
+                        .collect(),
+                })
+            })
+            .collect();
+        WorkspaceSnapshot {
+            workspaces: workspaces.into_values().collect(),
+            groups: groups,
+            outputs: outputs.into_values().collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct WorkspaceProtocol {
     _connection: Connection,
     _display: WlDisplay,
     _registry: WlRegistry,
-    _event_thread: JoinHandle<anyhow::Result<()>>,
+    _event_task: JoinHandle<anyhow::Result<()>>,
     _handle: QueueHandle<WorkspaceProtocolData>,
+
+    updates: UnboundedReceiver<WorkspaceSnapshot>,
 }
 
 impl WorkspaceProtocol {
-    pub fn new() -> Option<Self> {
-        let init = || -> anyhow::Result<Self> {
-            let connection = Connection::connect_to_env()?;
-            let display = connection.display();
-            let mut event_queue = connection.new_event_queue();
-            let handle = event_queue.handle();
-            let registry = display.get_registry(&handle, UserData {});
-            let event_thread = thread::spawn(move || {
-                let mut data = WorkspaceProtocolData::default();
-                event_queue.roundtrip(&mut data)?;
-                loop {
-                    event_queue.blocking_dispatch(&mut data)?;
-                }
-            });
-
-            let obj = Self {
-                _connection: connection,
-                _display: display,
-                _registry: registry,
-                _event_thread: event_thread,
-                _handle: handle,
-            };
-
-            Ok(obj)
+    fn event_loop(mut event_queue: EventQueue<WorkspaceProtocolData>) -> anyhow::Result<()> {
+        let mut data = WorkspaceProtocolData {
+            _manager: None,
+            workspaces: HashMap::new(),
+            groups: HashMap::new(),
+            outputs: HashMap::new(),
         };
+        event_queue.roundtrip(&mut data)?;
+        loop {
+            event_queue.blocking_dispatch(&mut data)?;
+        }
+    }
 
-        match init() {
-            Ok(obj) => Some(obj),
-            Err(err) => {
-                error!("Failed to initialize workspace protocol manager: {err}");
-                None
-            }
+    pub fn new() -> Result<Self> {
+        let connection = Connection::connect_to_env()?;
+        let display = connection.display();
+        let event_queue = connection.new_event_queue();
+        let handle = event_queue.handle();
+        let (tx, rx) = unbounded();
+        let registry = display.get_registry(&handle, tx);
+        let event_task = tokio::task::spawn_blocking(move || Self::event_loop(event_queue));
+
+        Ok(Self {
+            _connection: connection,
+            _display: display,
+            _registry: registry,
+            _event_task: event_task,
+            _handle: handle,
+
+            updates: rx,
+        })
+    }
+
+    pub async fn next_event(&mut self) -> Result<WorkspaceSnapshot> {
+        match self.updates.next().await {
+            Some(update) => Ok(update),
+            None => Err(anyhow::anyhow!("WorkspaceProtocol event channel closed")),
         }
     }
 }
 
 struct UserData;
 
-impl Dispatch<WlRegistry, UserData, Self> for WorkspaceProtocolData {
+impl Dispatch<WlRegistry, UnboundedSender<WorkspaceSnapshot>, Self> for WorkspaceProtocolData {
     fn event(
         state: &mut Self,
         proxy: &WlRegistry,
         event: wl_registry::Event,
-        _data: &UserData,
+        sender: &UnboundedSender<WorkspaceSnapshot>,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
@@ -126,7 +176,7 @@ impl Dispatch<WlRegistry, UserData, Self> for WorkspaceProtocolData {
             } => {
                 if interface == ExtWorkspaceManagerV1::interface().name {
                     debug!("Registered ExtWorkspaceManagerV1 v{version} (name: {name})");
-                    let manager = proxy.bind(name, version, qh, UserData);
+                    let manager = proxy.bind(name, version, qh, sender.clone());
                     if state._manager.is_some() {
                         error!("ExtWorkspaceManagerV1 is already bound!");
                     } else {
@@ -136,9 +186,7 @@ impl Dispatch<WlRegistry, UserData, Self> for WorkspaceProtocolData {
                 } else if interface == WlOutput::interface().name {
                     debug!("Registered WlOutput v{version} (name: {name})");
                     let output = proxy.bind(name, version, qh, UserData {});
-                    state
-                        .outputs
-                        .insert(output, RefCell::new(Output::default()).into());
+                    state.outputs.insert(output, Output::default());
                     info!("Bound to WlOutput");
                 }
             }
@@ -155,12 +203,14 @@ impl Dispatch<WlRegistry, UserData, Self> for WorkspaceProtocolData {
     }
 }
 
-impl Dispatch<ExtWorkspaceManagerV1, UserData, WorkspaceProtocolData> for WorkspaceProtocolData {
+impl Dispatch<ExtWorkspaceManagerV1, UnboundedSender<WorkspaceSnapshot>, WorkspaceProtocolData>
+    for WorkspaceProtocolData
+{
     fn event(
         state: &mut Self,
         _proxy: &ExtWorkspaceManagerV1,
         event: WorkspaceManagerEvent,
-        _data: &UserData,
+        sender: &UnboundedSender<WorkspaceSnapshot>,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
@@ -172,14 +222,16 @@ impl Dispatch<ExtWorkspaceManagerV1, UserData, WorkspaceProtocolData> for Worksp
                     .insert(workspace_group, WorkspaceGroup::default());
             }
             WorkspaceManagerEvent::Workspace { workspace } => {
-                state
-                    .workspaces
-                    .insert(workspace, RefCell::new(Workspace::default()).into());
+                state.workspaces.insert(workspace, Workspace::default());
             }
             WorkspaceManagerEvent::Done => {
                 info!("Finished receiving workspace data");
                 debug!("Workspaces: {:#?}", state.workspaces);
                 debug!("Workspace Groups: {:#?}", state.groups);
+                debug!("Outputs: {:#?}", state.outputs);
+                if let Err(err) = sender.unbounded_send((&*state).into()) {
+                    error!("Failed to send workspace snapshot: {}", err);
+                }
             }
             WorkspaceManagerEvent::Finished => {
                 warn!("Workspace manager has finished and will no longer send events");
@@ -221,7 +273,6 @@ impl Dispatch<ExtWorkspaceHandleV1, UserData, WorkspaceProtocolData> for Workspa
                 error!("Received event for unknown workspace: {:?}", event);
                 return;
             };
-            let workspace = &mut workspace.borrow_mut();
             match event {
                 WorkspaceEvent::Id { id } => {
                     workspace.id = Some(id);
@@ -304,32 +355,16 @@ impl Dispatch<ExtWorkspaceGroupHandleV1, UserData, WorkspaceProtocolData>
                 };
             }
             WorkspaceGroupEvent::OutputEnter { output } => {
-                let Some(output) = state.outputs.get(&output) else {
-                    warn!("Received OutputEnter for unknown output");
-                    return;
-                };
-                group.outputs.push(output.clone());
+                group.outputs.insert(output);
             }
             WorkspaceGroupEvent::OutputLeave { output } => {
-                let Some(output) = state.outputs.get(&output) else {
-                    warn!("Received OutputLeave for unknown output");
-                    return;
-                };
-                group.outputs.retain(|o| !Rc::ptr_eq(o, output));
+                group.outputs.remove(&output);
             }
             WorkspaceGroupEvent::WorkspaceEnter { workspace } => {
-                let Some(workspace) = state.workspaces.get(&workspace) else {
-                    warn!("Received WorkspaceEnter for unknown workspace");
-                    return;
-                };
-                group.workspaces.push(workspace.clone());
+                group.workspaces.insert(workspace);
             }
             WorkspaceGroupEvent::WorkspaceLeave { workspace } => {
-                let Some(workspace) = state.workspaces.get(&workspace) else {
-                    warn!("Received WorkspaceLeave for unknown workspace");
-                    return;
-                };
-                group.workspaces.retain(|w| !Rc::ptr_eq(w, workspace));
+                group.workspaces.remove(&workspace);
             }
             WorkspaceGroupEvent::Removed => {
                 debug!("Workspace group removed: {group:?}",);
@@ -356,7 +391,6 @@ impl Dispatch<WlOutput, UserData, WorkspaceProtocolData> for WorkspaceProtocolDa
             error!("Received event for unknown output: {:?}", event);
             return;
         };
-        let mut output = output.borrow_mut();
         match event {
             wayland_client::protocol::wl_output::Event::Name { name } => {
                 output.name = Some(name);
